@@ -130,6 +130,37 @@ Resources:
         - Key: Name
           Value: DjangoNATSecurityGroup
 
+  NATInstanceCWAgentConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /nat-instance/cloudwatch-agent-config
+      Type: String
+      Value: |
+        {
+          "logs": {
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  {
+                    "file_path": "/var/log/messages",
+                    "log_group_name": "/aws/ec2/nat-instance/messages",
+                    "log_stream_name": "{instance_id}"
+                  }
+                ]
+              }
+            }
+          },
+          "metrics": {
+            "metrics_collected": {
+              "mem": {
+                "measurement": [
+                  { "name": "mem_used_percent", "unit": "percent" }
+                ]
+              }
+            }
+          }
+        }
+
   NATInstance:
     Type: AWS::EC2::Instance
     Properties:
@@ -148,12 +179,17 @@ Resources:
           # Enable IP forwarding
           sysctl -w net.ipv4.ip_forward=1
           echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
-          
+
           # Set up NAT rules
           yum install -y iptables-services
           iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
           service iptables save
 
+          # Install and start CloudWatch Agent
+          yum install -y amazon-cloudwatch-agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 \
+            -c ssm:/nat-instance/cloudwatch-agent-config -s
 
   NATInstanceEIP:
     Type: AWS::EC2::EIP
