@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Secure Security Groups (v2) for EC2 Django App and RDS PostgreSQL
+
+Parameters:
+  MyVPC:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the security groups will be created
+
+  ALBSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID of the ALB that will access EC2 instances
+
+Resources:
+  # Security group for EC2 App instances (only allow traffic from ALB)
+  MyAppEC2SecurityGroupV2:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref MyVPC
+      GroupDescription: Allow only ALB traffic (HTTP/HTTPS) to EC2 for Django App
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroupId
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ALBSecurityGroupId
+      Tags:
+        - Key: Name
+          Value: DjangoAppEC2SG-V2
+
+  # Security group for RDS (only allow traffic from EC2 app and CodeBuild)
+  MyRdsSecurityGroupV2:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref MyVPC
+      GroupDescription: Allow PostgreSQL access from EC2 app instances only
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref MyAppEC2SecurityGroupV2
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref MyCodeBuildSecurityGroupV2          
+
+      Tags:
+        - Key: Name
+          Value: DjangoRdsSG-V2
+  # Security group for CodeBuild (for database migrations, testing, etc.)
+  MyCodeBuildSecurityGroupV2:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref MyVPC
+      GroupDescription: Allow CodeBuild traffic to RDS for DB migrations, etc.
+      Tags:
+        - Key: Name
+          Value: DjangoCodeBuildSG-V2
+
+
+Outputs:
+  MyAppEC2SecurityGroupV2:
+    Description: EC2 Security Group ID (v2) - only ALB access allowed
+    Value: !Ref MyAppEC2SecurityGroupV2
+    Export:
+      Name: MyAppEC2SecurityGroupV2
+
+  MyRdsSecurityGroupV2:
+    Description: RDS Security Group ID (v2) - only EC2 access allowed
+    Value: !Ref MyRdsSecurityGroupV2
+    Export:
+      Name: MyRdsSecurityGroupV2
+  
+  MyCodeBuildSecurityGroupV2:
+    Description: Security Group for CodeBuild to access RDS (v2)
+    Value: !Ref MyCodeBuildSecurityGroupV2
+    Export:
+      Name: MyCodeBuildSecurityGroupV2
+

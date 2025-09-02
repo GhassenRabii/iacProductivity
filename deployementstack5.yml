@@ -1,0 +1,415 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ASG (Green) + CodeBuild + CodePipeline + CodeDeploy for Django App v2
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnet1v2:
+    Type: AWS::EC2::Subnet::Id
+  PrivateSubnet2v2:
+    Type: AWS::EC2::Subnet::Id
+  AppEC2SecurityGroupv2:
+    Type: AWS::EC2::SecurityGroup::Id
+  RdsEndpointv2:
+    Type: String
+    Description: RDS endpoint (from Stack 2 v2 output)
+  DjangoDBSecretArnv2:
+    Type: String
+    Description: ARN for Secrets Manager secret (from Stack 2 v2 output)
+  TargetGroupArn:
+    Type: String
+    Description: ALB Target Group ARN (from your ALB stack)
+  GitHubRepo:
+    Type: String
+    Description: GitHub repo format:username/repo
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch to build from
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: GitHub personal access token
+  EC2KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair
+  AMIId:
+    Type: AWS::EC2::Image::Id
+    Description: Pre-baked AMI for Django App (Amazon Linux 2, etc.)
+  MyCodeBuildSecurityGroupV2:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group for CodeBuild to access VPC resources (import from SG stack)
+
+Resources:
+
+  ## S3 bucket for artifacts
+  ArtifactBucketv2:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub django-app-artifacts-v2-${AWS::AccountId}-${AWS::Region}
+  ArtifactBucketPolicyv2:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucketv2
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowPipelineAndDeployRead
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt CodePipelineServiceRolev2.Arn
+                - !GetAtt CodeDeployServiceRolev2.Arn
+            Action:
+              - s3:ListBucket
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource:
+              - !Sub arn:aws:s3:::${ArtifactBucketv2}
+              - !Sub arn:aws:s3:::${ArtifactBucketv2}/*    
+  ## EC2 IAM Role
+  DjangoEC2Rolev2:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+      Policies:
+        - PolicyName: DjangoEC2Policyv2
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - logs:*
+                  - codedeploy:*
+                Resource: '*'
+
+  DjangoEC2InstanceProfilev2:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref DjangoEC2Rolev2
+
+  ## CodeDeploy Role
+  CodeDeployServiceRolev2:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeDeployPolicyv2
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - s3:Get*
+                  - s3:List*
+                  - tag:GetTags
+                  - iam:PassRole
+                  - autoscaling:*
+                  - cloudwatch:*
+                Resource: '*'
+
+  ## CodeDeploy Application
+  CodeDeployApplicationv2:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: DjangoAppCodeDeployv2
+      ComputePlatform: Server
+
+  ## CodeDeploy Deployment Group (targets the ASG)
+  CodeDeployDeploymentGroupv2:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplicationv2
+      DeploymentGroupName: DjangoAppDeploymentGroupv2
+      ServiceRoleArn: !GetAtt CodeDeployServiceRolev2.Arn
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      AutoScalingGroups:
+        - !Ref DjangoGreenASGv2
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: !Select
+              - 1
+              - !Split
+                - /
+                - !Ref TargetGroupArn
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+
+  ## Launch Template for ASG
+  DjangoGreenLaunchTemplatev2:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: django-green-lt-v2
+      LaunchTemplateData:
+        InstanceType: t2.micro
+        ImageId: !Ref AMIId
+        KeyName: !Ref EC2KeyName
+        IamInstanceProfile:
+          Name: !Ref DjangoEC2InstanceProfilev2
+        SecurityGroupIds:
+          - !Ref AppEC2SecurityGroupv2
+        UserData: !Base64
+          Fn::Sub: |
+            #!/bin/bash
+            yum update -y
+            yum install -y python3 git amazon-cloudwatch-agent
+            amazon-linux-extras install epel -y
+            yum install -y python3-pip ruby wget
+            pip3 install --upgrade pip virtualenv boto3 gunicorn
+            # CloudWatch Agent config
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<EOF
+            {
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      {
+                        "file_path": "/var/log/messages",
+                        "log_group_name": "/ec2/django-app-v2/messages",
+                        "log_stream_name": "{instance_id}"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+            EOF
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config -m ec2 \
+              -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+            # Install CodeDeploy agent
+            cd /home/ec2-user
+            wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+            chmod +x ./install
+            ./install auto
+            systemctl enable codedeploy-agent
+            systemctl start codedeploy-agent
+            echo "export DJANGO_DB_SECRET_ARN=${DjangoDBSecretArnv2}" >> /home/ec2-user/.bash_profile
+            echo "export DJANGO_DB_HOST=${RdsEndpointv2}" >> /home/ec2-user/.bash_profile
+
+  ## Auto Scaling Group (Green)
+  DjangoGreenASGv2:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1v2
+        - !Ref PrivateSubnet2v2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DjangoGreenLaunchTemplatev2
+        Version: !GetAtt DjangoGreenLaunchTemplatev2.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 2
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - !Ref TargetGroupArn
+      Tags:
+        - Key: Name
+          Value: DjangoAppGreenInstance
+          PropagateAtLaunch: true
+
+  ## CodeBuild Service Role
+  CodeBuildServiceRolev2:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildAccessv2
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                  - logs:*
+                  - codedeploy:*
+                  - secretsmanager:GetSecretValue
+                  - ssm:GetParameter
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:CreateNetworkInterfacePermission
+                  - ec2:DetachNetworkInterface
+                  - ec2:AttachNetworkInterface
+                  - ec2:DescribeDhcpOptions 
+
+                
+                Resource: '*'
+
+  ## CodeBuild Project
+  DjangoCodeBuildProjectv2:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: django-app-build-v2
+      Source:
+        Type: GITHUB
+        Location: !Sub https://github.com/${GitHubRepo}.git
+        GitCloneDepth: 1
+        BuildSpec: buildspec.yml
+        Auth:
+          Type: OAUTH
+          Resource: !Ref GitHubToken
+      Artifacts:
+        Type: S3
+        Location: !Ref ArtifactBucketv2
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: DJANGO_DB_SECRET_ARN
+            Value: !Ref DjangoDBSecretArnv2
+          - Name: DJANGO_DB_HOST
+            Value: !Ref RdsEndpointv2
+          - Name: GITHUB_TOKEN
+            Value: !Ref GitHubToken
+      VpcConfig:
+        VpcId: !Ref VpcId
+        Subnets:
+          - !Ref PrivateSubnet1v2
+          - !Ref PrivateSubnet2v2
+        SecurityGroupIds:
+          - !Ref MyCodeBuildSecurityGroupV2
+      ServiceRole: !Ref CodeBuildServiceRolev2
+
+
+  ## CodePipeline Service Role
+  CodePipelineServiceRolev2:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelineAccessv2
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetProjects
+                  - codebuild:BatchGetBuildBatches
+                  - codedeploy:*
+                Resource: '*'
+
+  ## CodePipeline
+  DjangoAppPipelinev2:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRolev2.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucketv2
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub_Source_v2
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: 1
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                Owner: !Select
+                  - 0
+                  - !Split
+                    - /
+                    - !Ref GitHubRepo
+                Repo: !Select
+                  - 1
+                  - !Split
+                    - /
+                    - !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+                PollForSourceChanges: 'false'
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: DjangoBuildv2
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ProjectName: !Ref DjangoCodeBuildProjectv2
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: DeployToASGv2
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: 1
+              InputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplicationv2
+                DeploymentGroupName: !Ref CodeDeployDeploymentGroupv2
+              RunOrder: 1
+
+Outputs:
+  DjangoGreenASGv2:
+    Description: Green ASG name (v2)
+    Value: !Ref DjangoGreenASGv2
+  DjangoGreenLaunchTemplatev2:
+    Description: Green Launch Template name (v2)
+    Value: !Ref DjangoGreenLaunchTemplatev2
+  ArtifactBucketv2:
+    Description: S3 bucket for artifacts (v2)
+    Value: !Ref ArtifactBucketv2
+  DjangoCodeBuildProjectv2:
+    Description: CodeBuild Project Name (v2)
+    Value: !Ref DjangoCodeBuildProjectv2
+  DjangoAppPipelinev2:
+    Description: CodePipeline Name (v2)
+    Value: !Ref DjangoAppPipelinev2
+  CodeDeployApplicationv2:
+    Description: CodeDeploy Application Name (v2)
+    Value: !Ref CodeDeployApplicationv2
+  CodeDeployDeploymentGroupv2:
+    Description: CodeDeploy Deployment Group (v2)
+    Value: !Ref CodeDeployDeploymentGroupv2

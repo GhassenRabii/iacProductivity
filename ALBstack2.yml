@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ALB for Django App (public subnets, HTTP & HTTPS listeners)
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the ALB
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: First public subnet for ALB
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second public subnet for ALB
+  ACMCertificateArn:
+    Type: String
+    Description: ACM certificate ARN for HTTPS (must be in this region)
+
+Resources:
+
+  ALBSecurityGroupV2:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and HTTPS from anywhere to ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIpv6: ::/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: django-alb-sg-v2
+
+  DjangoALBV2:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: django-albv2
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroupV2
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+
+  # Target group expects EC2s to register later (dynamic registration allowed)
+  DjangoALBTargetGroupV2:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: django-alb-tgN80V2
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckPath: /health/
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '80'
+      Matcher:
+        HttpCode: 200-399
+
+  # HTTP listener forwards to the TG
+  DjangoALBListenerHTTPV2:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref DjangoALBV2
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref DjangoALBTargetGroupV2
+
+  # HTTPS listener forwards to the same TG
+  DjangoALBListenerHTTPSV2:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref DjangoALBV2
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref ACMCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref DjangoALBTargetGroupV2
+
+Outputs:
+  ALBDNSName:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt DjangoALBV2.DNSName
+  ALBSecurityGroupId:
+    Description: Security Group ID for the ALB
+    Value: !Ref ALBSecurityGroupV2
+  TargetGroupArn:
+    Description: ARN of the Target Group (register EC2s here in your other stack)
+    Value: !Ref DjangoALBTargetGroupV2
