@@ -36,6 +36,15 @@ Parameters:
     Default: t3.micro
     Description: Instance type for NAT instance
 
+  NatKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 KeyPair name for NAT instance SSH
+
+  AdminIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to SSH to the NAT instance (e.g., 203.0.113.25/32)
+
 Resources:
 
   MyVPCv2:
@@ -110,14 +119,18 @@ Resources:
     Properties:
       GroupDescription: NAT instance security group
       VpcId: !Ref MyVPCv2
-      SecurityGroupEgress:
-        - IpProtocol: -1
-          CidrIp: 0.0.0.0/0
       SecurityGroupIngress:
         - IpProtocol: -1
           CidrIp: !Ref PrivateSubnet1Cidr
         - IpProtocol: -1
           CidrIp: !Ref PrivateSubnet2Cidr
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminIngressCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
       Tags:
         - Key: Name
           Value: DjangoNATSecurityGroup
@@ -181,6 +194,7 @@ Resources:
   NATInstance:
     Type: AWS::EC2::Instance
     Properties:
+      KeyName: !Ref NatKeyName
       InstanceType: !Ref NATInstanceType
       ImageId: !Ref NATInstanceAmiId
       SubnetId: !Ref PublicSubnet1v2
@@ -196,16 +210,33 @@ Resources:
           #!/bin/bash
           set -euo pipefail
 
-          # Enable IP forwarding
+          # Enable IP forwarding persistently and now
           sysctl -w net.ipv4.ip_forward=1
+          sed -i '/^net\.ipv4\.ip_forward/d' /etc/sysctl.conf
           echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
 
-          # Set up NAT rules
+          # Install iptables-services (Amazon Linux 2) and enable service
           yum install -y iptables-services
+
+          # Flush any stale rules
+          iptables -F
+          iptables -t nat -F
+
+          # NAT (masquerade) egress on the public interface
           iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
+          # Allow forwarding: return traffic and traffic from VPC to the internet
+          iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+          iptables -A FORWARD -s ${VpcCidr} -o eth0 -j ACCEPT
+
+          # Save and start iptables
           service iptables save
           systemctl enable iptables
-          systemctl start iptables
+          systemctl restart iptables
+
+          # Ensure SSM Agent is installed/enabled (AL2 has it by default)
+          systemctl enable amazon-ssm-agent || true
+          systemctl restart amazon-ssm-agent || true
 
           # Install and start CloudWatch Agent
           yum install -y amazon-cloudwatch-agent
@@ -299,17 +330,13 @@ Resources:
   EndpointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for interface endpoints (allow 443 from private subnets)
+      GroupDescription: Security group for interface endpoints (allow 443 from whole VPC)
       VpcId: !Ref MyVPCv2
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: !Ref PrivateSubnet1Cidr
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: !Ref PrivateSubnet2Cidr
+          CidrIp: !Ref VpcCidr
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
@@ -327,7 +354,7 @@ Resources:
       RouteTableIds:
         - !Ref PrivateRouteTable1v2
         - !Ref PrivateRouteTable2v2
-      # Optional: add a PolicyDocument to restrict to specific buckets
+      # Optional: add PolicyDocument to restrict to specific buckets
 
   SSMMessagesEndpoint:
     Type: AWS::EC2::VPCEndpoint
