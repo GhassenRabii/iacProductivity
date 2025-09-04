@@ -169,6 +169,7 @@ Resources:
   NatInstanceRole:
     Type: AWS::IAM::Role
     Properties:
+      # (Optionally remove RoleName to let CFN autogenerate for easier updates)
       RoleName: !Sub DjangoNATInstanceRole-${AWS::StackName}
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -187,6 +188,7 @@ Resources:
   NatInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
+      # (Optionally remove InstanceProfileName to autogenerate)
       InstanceProfileName: !Sub DjangoNATInstanceProfile-${AWS::StackName}
       Roles:
         - !Ref NatInstanceRole
@@ -210,48 +212,52 @@ Resources:
           #!/bin/bash
           set -euo pipefail
 
-          # Enable IP forwarding persistently and now
+          # Detect public egress interface (eth0 on Nitro, but detect just in case)
+          PUB_IF="$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+          [ -n "$PUB_IF" ] || PUB_IF=eth0
+
+          # Enable IPv4 forwarding now + persistently
           sysctl -w net.ipv4.ip_forward=1
           sed -i '/^net\.ipv4\.ip_forward/d' /etc/sysctl.conf
           echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
 
-          # Install iptables-services (Amazon Linux 2) and enable service
-          yum install -y iptables-services
+          # Flush then add NAT + forward rules with detected interface
+          iptables -F || true
+          iptables -t nat -F || true
+          iptables -t nat -A POSTROUTING -o "$PUB_IF" -j MASQUERADE
+          iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+          iptables -A FORWARD -s ${VpcCidr} -o "$PUB_IF" -j ACCEPT
 
-          # Flush any stale rules
-          iptables -F
-          iptables -t nat -F
+          # Persist rules (Amazon Linux 2)
+          yum install -y -q iptables-services || true
+          service iptables save || iptables-save > /etc/sysconfig/iptables
+          systemctl enable iptables || true
+          systemctl restart iptables || true
 
-          # NAT (masquerade) egress on the public interface
-          iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-
-          # Allow forwarding: return traffic and traffic from VPC to the internet
-          iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
-          iptables -A FORWARD -s ${VpcCidr} -o eth0 -j ACCEPT
-
-          # Save and start iptables
-          service iptables save
-          systemctl enable iptables
-          systemctl restart iptables
-
-          # Ensure SSM Agent is installed/enabled (AL2 has it by default)
+          # Ensure SSM Agent is enabled/running
           systemctl enable amazon-ssm-agent || true
           systemctl restart amazon-ssm-agent || true
 
-          # Install and start CloudWatch Agent
-          yum install -y amazon-cloudwatch-agent
+          # Install and start CloudWatch Agent (optional)
+          yum install -y -q amazon-cloudwatch-agent || true
           /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
             -a fetch-config -m ec2 \
-            -c ssm:/nat-instance/cloudwatch-agent-config -s
+            -c ssm:/nat-instance/cloudwatch-agent-config -s || true
 
-  NATInstanceEIP:
+  # Allocate EIP and associate separately (safer pattern)
+  NATInstanceEip:
     Type: AWS::EC2::EIP
     Properties:
       Domain: vpc
+    Tags:
+      - Key: Name
+        Value: DjangoNATInstanceEIP
+
+  NATInstanceEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt NATInstanceEip.AllocationId
       InstanceId: !Ref NATInstance
-      Tags:
-        - Key: Name
-          Value: DjangoNATInstanceEIP
 
   PublicRouteTablev2:
     Type: AWS::EC2::RouteTable
@@ -531,7 +537,7 @@ Outputs:
 
   NATInstanceEIPOut:
     Description: NAT instance Elastic IP
-    Value: !Ref NATInstanceEIP
+    Value: !Ref NATInstanceEip
     Export:
       Name: MyNATInstanceEIP
 
