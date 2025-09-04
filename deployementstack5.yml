@@ -34,8 +34,9 @@ Parameters:
     Type: AWS::EC2::KeyPair::KeyName
     Description: Name of an existing EC2 KeyPair
   AMIId:
-    Type: AWS::EC2::Image::Id
-    Description: Pre-baked AMI for Django App (Amazon Linux 2, etc.)
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: Latest Amazon Linux 2023 AMI from SSM Parameter Store
   MyCodeBuildSecurityGroupV2:
     Type: AWS::EC2::SecurityGroup::Id
     Description: Security group for CodeBuild to access VPC resources (import from SG stack)
@@ -171,10 +172,9 @@ Resources:
         UserData: !Base64
           Fn::Sub: |
             #!/bin/bash
-            yum update -y
-            yum install -y python3 git amazon-cloudwatch-agent
-            amazon-linux-extras install epel -y
-            yum install -y python3-pip ruby wget
+            dnf update -y
+            dnf install -y python3 git amazon-cloudwatch-agent
+            dnf install -y python3-pip ruby wget
             pip3 install --upgrade pip virtualenv boto3 gunicorn
             # CloudWatch Agent config
             cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<EOF
